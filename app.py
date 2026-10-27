@@ -1,7 +1,7 @@
 import hashlib
 import hmac
-import html
 import io
+import json
 import os
 import re
 import struct
@@ -36,6 +36,23 @@ CUSTOM_IDS = (
     "5190806721286657692",  # chart
 )
 CUSTOM_FALLBACKS = ("🚀", "✨", "📸", "➡️", "✅", "🔝", "📷", "📊")
+
+STYLE_LABELS = {
+    "Status": "𝗦𝗧𝗔𝗧𝗨𝗦",
+    "Capture": "𝗖𝗔𝗣𝗧𝗨𝗥𝗘",
+    "Device": "𝗗𝗘𝗩𝗜𝗖𝗘",
+    "Android": "𝗔𝗡𝗗𝗥𝗢𝗜𝗗",
+    "VORZEX": "𝗩𝗢𝗥𝗭𝗘𝗫",
+    "Date": "𝗗𝗔𝗧𝗘",
+    "Mode": "𝗠𝗢𝗗𝗘",
+    "Result": "𝗥𝗘𝗦𝗨𝗟𝗧",
+    "Win margin": "𝗪𝗜𝗡 𝗠𝗔𝗥𝗚𝗜𝗡",
+    "Match shots": "𝗠𝗔𝗧𝗖𝗛 𝗦𝗛𝗢𝗧𝗦",
+    "Match duration": "𝗠𝗔𝗧𝗖𝗛 𝗧𝗜𝗠𝗘",
+    "Engine total shots": "𝗧𝗢𝗧𝗔𝗟 𝗦𝗛𝗢𝗧𝗦",
+    "Engine accuracy": "𝗔𝗖𝗖𝗨𝗥𝗔𝗖𝗬",
+    "Verified wins": "𝗩𝗘𝗥𝗜𝗙𝗜𝗘𝗗 𝗪𝗜𝗡𝗦",
+}
 
 _lock = threading.Lock()
 _seen_nonces: dict[str, float] = {}
@@ -84,30 +101,50 @@ def _claim_nonce(nonce: str, client_key: str, now: float) -> bool:
         return True
 
 
-def _animated_caption(plain: str, kind: str) -> str:
-    lines = plain.splitlines() or ["VORZEX ENGINE"]
+def _utf16_length(value: str) -> int:
+    return len(value.encode("utf-16-le")) // 2
+
+
+def _styled_caption(plain: str, kind: str) -> tuple[str, list[dict[str, object]]]:
+    source = plain.splitlines() or ["VORZEX ENGINE"]
     start = 0 if kind == "launch" else 4
+    title = "𝗩𝗢𝗥𝗭𝗘𝗫 𝗘𝗡𝗚𝗜𝗡𝗘  •  " + ("𝗟𝗔𝗨𝗡𝗖𝗛" if kind == "launch" else "𝗩𝗜𝗖𝗧𝗢𝗥𝗬")
+    content = [title, "━━━━━━━━━━━━━━━━━━━━"]
+    for line in source[1:]:
+        label, separator, value = line.partition(":")
+        if separator:
+            content.append(f"{STYLE_LABELS.get(label.strip(), label.strip().upper())}  ›  {value.strip()}")
+        elif line.strip():
+            content.append(line.strip())
+
     rendered: list[str] = []
-    for index, line in enumerate(lines):
+    entities: list[dict[str, object]] = []
+    offset = 0
+    for index, line in enumerate(content):
         slot = (start + index) % len(CUSTOM_IDS)
-        emoji = (
-            f'<tg-emoji emoji-id="{CUSTOM_IDS[slot]}">'
-            f"{CUSTOM_FALLBACKS[slot]}</tg-emoji>"
-        )
-        safe = html.escape(line, quote=False)
-        rendered.append(f"{emoji} <b>{safe}</b>" if index == 0 else f"{emoji} {safe}")
-    return "\n".join(rendered)
+        emoji = CUSTOM_FALLBACKS[slot]
+        rendered_line = f"{emoji}  {line}"
+        entities.append({
+            "type": "custom_emoji",
+            "offset": offset,
+            "length": _utf16_length(emoji),
+            "custom_emoji_id": CUSTOM_IDS[slot],
+        })
+        rendered.append(rendered_line)
+        offset += _utf16_length(rendered_line) + 1
+    return "\n".join(rendered), entities
 
 
 def _telegram_send(image: bytes, caption: str, kind: str, animated: bool) -> requests.Response:
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    styled, entities = _styled_caption(caption, kind)
     data = {
         "chat_id": CHAT_ID,
-        "caption": _animated_caption(caption, kind) if animated else caption,
+        "caption": styled,
         "protect_content": "true",
     }
     if animated:
-        data["parse_mode"] = "HTML"
+        data["caption_entities"] = json.dumps(entities, separators=(",", ":"))
     filename = "vorzex-launch.png" if kind == "launch" else "vorzex-win.png"
     return requests.post(
         url,
@@ -161,12 +198,14 @@ def feedback():
 
     try:
         response = _telegram_send(image, caption, kind, animated=True)
+        premium_emoji = response.status_code == 200 and response.json().get("ok", False)
         if response.status_code != 200 or not response.json().get("ok", False):
-            # Premium custom emoji can be unavailable for a bot/channel. Preserve the post by
-            # retrying once with normal Unicode emoji and the same real data.
+            # Channels require Fragment additional-username eligibility for bot custom emoji.
+            # Preserve the unique Unicode typography while retrying without custom entities.
             response = _telegram_send(image, caption, kind, animated=False)
+            premium_emoji = False
         if response.status_code == 200 and response.json().get("ok", False):
-            return jsonify(ok=True), 200
+            return jsonify(ok=True, premium_emoji=premium_emoji), 200
         return jsonify(ok=False, error="telegram_rejected"), 502
     except (requests.RequestException, ValueError):
         return jsonify(ok=False, error="telegram_unavailable"), 502
